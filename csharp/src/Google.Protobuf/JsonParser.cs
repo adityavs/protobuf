@@ -77,6 +77,7 @@ namespace Google.Protobuf
             { ListValue.Descriptor.FullName, (parser, message, tokenizer) =>
                 parser.MergeRepeatedField(message, message.Descriptor.Fields[ListValue.ValuesFieldNumber], tokenizer) },
             { Struct.Descriptor.FullName, (parser, message, tokenizer) => parser.MergeStruct(message, tokenizer) },
+            { Any.Descriptor.FullName, (parser, message, tokenizer) => parser.MergeAny(message, tokenizer) },
             { FieldMask.Descriptor.FullName, (parser, message, tokenizer) => MergeFieldMask(message, tokenizer.Next()) },
             { Int32Value.Descriptor.FullName, MergeWrapperField },
             { Int64Value.Descriptor.FullName, MergeWrapperField },
@@ -85,14 +86,15 @@ namespace Google.Protobuf
             { FloatValue.Descriptor.FullName, MergeWrapperField },
             { DoubleValue.Descriptor.FullName, MergeWrapperField },
             { BytesValue.Descriptor.FullName, MergeWrapperField },
-            { StringValue.Descriptor.FullName, MergeWrapperField }
+            { StringValue.Descriptor.FullName, MergeWrapperField },
+            { BoolValue.Descriptor.FullName, MergeWrapperField }
         };
 
         // Convenience method to avoid having to repeat the same code multiple times in the above
         // dictionary initialization.
         private static void MergeWrapperField(JsonParser parser, IMessage message, JsonTokenizer tokenizer)
         {
-            parser.MergeField(message, message.Descriptor.Fields[Wrappers.WrapperValueFieldNumber], tokenizer);
+            parser.MergeField(message, message.Descriptor.Fields[WrappersReflection.WrapperValueFieldNumber], tokenizer);
         }
 
         /// <summary>
@@ -128,7 +130,7 @@ namespace Google.Protobuf
         /// <param name="jsonReader">Reader providing the JSON to parse.</param>
         internal void Merge(IMessage message, TextReader jsonReader)
         {
-            var tokenizer = new JsonTokenizer(jsonReader);
+            var tokenizer = JsonTokenizer.FromTextReader(jsonReader);
             Merge(message, tokenizer);
             var lastToken = tokenizer.Next();
             if (lastToken != JsonToken.EndDocument)
@@ -167,6 +169,10 @@ namespace Google.Protobuf
             }
             var descriptor = message.Descriptor;
             var jsonFieldMap = descriptor.Fields.ByJsonName();
+            // All the oneof fields we've already accounted for - we can only see each of them once.
+            // The set is created lazily to avoid the overhead of creating a set for every message
+            // we parsed, when oneofs are relatively rare.
+            HashSet<OneofDescriptor> seenOneofs = null;
             while (true)
             {
                 token = tokenizer.Next();
@@ -182,6 +188,17 @@ namespace Google.Protobuf
                 FieldDescriptor field;
                 if (jsonFieldMap.TryGetValue(name, out field))
                 {
+                    if (field.ContainingOneof != null)
+                    {
+                        if (seenOneofs == null)
+                        {
+                            seenOneofs = new HashSet<OneofDescriptor>();
+                        }
+                        if (!seenOneofs.Add(field.ContainingOneof))
+                        {
+                            throw new InvalidProtocolBufferException($"Multiple values specified for oneof {field.ContainingOneof.Name}");
+                        }
+                    }
                     MergeField(message, field, tokenizer);
                 }
                 else
@@ -199,10 +216,15 @@ namespace Google.Protobuf
             var token = tokenizer.Next();
             if (token.Type == JsonToken.TokenType.Null)
             {
+                // Clear the field if we see a null token, unless it's for a singular field of type
+                // google.protobuf.Value.
                 // Note: different from Java API, which just ignores it.
                 // TODO: Bring it more in line? Discuss...
-                field.Accessor.Clear(message);
-                return;
+                if (field.IsMap || field.IsRepeated || !IsGoogleProtobufValueField(field))
+                {
+                    field.Accessor.Clear(message);
+                    return;
+                }
             }
             tokenizer.PushBack(token);
 
@@ -238,6 +260,10 @@ namespace Google.Protobuf
                     return;
                 }
                 tokenizer.PushBack(token);
+                if (token.Type == JsonToken.TokenType.Null)
+                {
+                    throw new InvalidProtocolBufferException("Repeated field elements cannot be null");
+                }
                 list.Add(ParseSingleValue(field, tokenizer));
             }
         }
@@ -269,9 +295,18 @@ namespace Google.Protobuf
                 }
                 object key = ParseMapKey(keyField, token.StringValue);
                 object value = ParseSingleValue(valueField, tokenizer);
-                // TODO: Null handling
+                if (value == null)
+                {
+                    throw new InvalidProtocolBufferException("Map values must not be null");
+                }
                 dictionary[key] = value;
             }
+        }
+
+        private static bool IsGoogleProtobufValueField(FieldDescriptor field)
+        {
+            return field.FieldType == FieldType.Message &&
+                field.MessageType.FullName == Value.Descriptor.FullName;
         }
 
         private object ParseSingleValue(FieldDescriptor field, JsonTokenizer tokenizer)
@@ -279,9 +314,11 @@ namespace Google.Protobuf
             var token = tokenizer.Next();
             if (token.Type == JsonToken.TokenType.Null)
             {
-                if (field.FieldType == FieldType.Message && field.MessageType.FullName == Value.Descriptor.FullName)
+                // TODO: In order to support dynamic messages, we should really build this up
+                // dynamically.
+                if (IsGoogleProtobufValueField(field))
                 {
-                    return new Value { NullValue = NullValue.NULL_VALUE };
+                    return Value.ForNull();
                 }
                 return null;
             }
@@ -291,10 +328,9 @@ namespace Google.Protobuf
             {
                 // Parse wrapper types as their constituent types.
                 // TODO: What does this mean for null?
-                // TODO: Detect this differently when we have dynamic messages, and put it in one place...
-                if (field.MessageType.IsWellKnownType && field.MessageType.File == Int32Value.Descriptor.File)
+                if (field.MessageType.IsWrapperType)
                 {
-                    field = field.MessageType.Fields[Wrappers.WrapperValueFieldNumber];
+                    field = field.MessageType.Fields[WrappersReflection.WrapperValueFieldNumber];
                     fieldType = field.FieldType;
                 }
                 else
@@ -339,6 +375,7 @@ namespace Google.Protobuf
         /// <exception cref="InvalidProtocolBufferException">The JSON does not represent a Protocol Buffers message correctly</exception>
         public T Parse<T>(string json) where T : IMessage, new()
         {
+            ProtoPreconditions.CheckNotNull(json, nameof(json));
             return Parse<T>(new StringReader(json));
         }
 
@@ -351,7 +388,38 @@ namespace Google.Protobuf
         /// <exception cref="InvalidProtocolBufferException">The JSON does not represent a Protocol Buffers message correctly</exception>
         public T Parse<T>(TextReader jsonReader) where T : IMessage, new()
         {
+            ProtoPreconditions.CheckNotNull(jsonReader, nameof(jsonReader));
             T message = new T();
+            Merge(message, jsonReader);
+            return message;
+        }
+
+        /// <summary>
+        /// Parses <paramref name="json"/> into a new message.
+        /// </summary>
+        /// <param name="json">The JSON to parse.</param>
+        /// <param name="descriptor">Descriptor of message type to parse.</param>
+        /// <exception cref="InvalidJsonException">The JSON does not comply with RFC 7159</exception>
+        /// <exception cref="InvalidProtocolBufferException">The JSON does not represent a Protocol Buffers message correctly</exception>
+        public IMessage Parse(string json, MessageDescriptor descriptor)
+        {
+            ProtoPreconditions.CheckNotNull(json, nameof(json));
+            ProtoPreconditions.CheckNotNull(descriptor, nameof(descriptor));
+            return Parse(new StringReader(json), descriptor);
+        }
+
+        /// <summary>
+        /// Parses JSON read from <paramref name="jsonReader"/> into a new message.
+        /// </summary>
+        /// <param name="jsonReader">Reader providing the JSON to parse.</param>
+        /// <param name="descriptor">Descriptor of message type to parse.</param>
+        /// <exception cref="InvalidJsonException">The JSON does not comply with RFC 7159</exception>
+        /// <exception cref="InvalidProtocolBufferException">The JSON does not represent a Protocol Buffers message correctly</exception>
+        public IMessage Parse(TextReader jsonReader, MessageDescriptor descriptor)
+        {
+            ProtoPreconditions.CheckNotNull(jsonReader, nameof(jsonReader));
+            ProtoPreconditions.CheckNotNull(descriptor, nameof(descriptor));
+            IMessage message = descriptor.Parser.CreateTemplate();
             Merge(message, jsonReader);
             return message;
         }
@@ -411,6 +479,88 @@ namespace Google.Protobuf
             MergeMapField(message, field, tokenizer);
         }
 
+        private void MergeAny(IMessage message, JsonTokenizer tokenizer)
+        {
+            // Record the token stream until we see the @type property. At that point, we can take the value, consult
+            // the type registry for the relevant message, and replay the stream, omitting the @type property.
+            var tokens = new List<JsonToken>();
+
+            var token = tokenizer.Next();
+            if (token.Type != JsonToken.TokenType.StartObject)
+            {
+                throw new InvalidProtocolBufferException("Expected object value for Any");
+            }
+            int typeUrlObjectDepth = tokenizer.ObjectDepth;
+
+            // The check for the property depth protects us from nested Any values which occur before the type URL
+            // for *this* Any.
+            while (token.Type != JsonToken.TokenType.Name ||
+                token.StringValue != JsonFormatter.AnyTypeUrlField ||
+                tokenizer.ObjectDepth != typeUrlObjectDepth)
+            {
+                tokens.Add(token);
+                token = tokenizer.Next();
+
+                if (tokenizer.ObjectDepth < typeUrlObjectDepth)
+                {
+                    throw new InvalidProtocolBufferException("Any message with no @type");
+                }
+            }
+
+            // Don't add the @type property or its value to the recorded token list
+            token = tokenizer.Next();
+            if (token.Type != JsonToken.TokenType.StringValue)
+            {
+                throw new InvalidProtocolBufferException("Expected string value for Any.@type");
+            }
+            string typeUrl = token.StringValue;
+            string typeName = Any.GetTypeName(typeUrl);
+
+            MessageDescriptor descriptor = settings.TypeRegistry.Find(typeName);
+            if (descriptor == null)
+            {
+                throw new InvalidOperationException($"Type registry has no descriptor for type name '{typeName}'");
+            }
+
+            // Now replay the token stream we've already read and anything that remains of the object, just parsing it
+            // as normal. Our original tokenizer should end up at the end of the object.
+            var replay = JsonTokenizer.FromReplayedTokens(tokens, tokenizer);
+            var body = descriptor.Parser.CreateTemplate();
+            if (descriptor.IsWellKnownType)
+            {
+                MergeWellKnownTypeAnyBody(body, replay);
+            }
+            else
+            {
+                Merge(body, replay);
+            }
+            var data = body.ToByteString();
+
+            // Now that we have the message data, we can pack it into an Any (the message received as a parameter).
+            message.Descriptor.Fields[Any.TypeUrlFieldNumber].Accessor.SetValue(message, typeUrl);
+            message.Descriptor.Fields[Any.ValueFieldNumber].Accessor.SetValue(message, data);
+        }
+
+        // Well-known types end up in a property called "value" in the JSON. As there's no longer a @type property
+        // in the given JSON token stream, we should *only* have tokens of start-object, name("value"), the value
+        // itself, and then end-object.
+        private void MergeWellKnownTypeAnyBody(IMessage body, JsonTokenizer tokenizer)
+        {
+            var token = tokenizer.Next(); // Definitely start-object; checked in previous method
+            token = tokenizer.Next();
+            // TODO: What about an absent Int32Value, for example?
+            if (token.Type != JsonToken.TokenType.Name || token.StringValue != JsonFormatter.AnyWellKnownTypeValueField)
+            {
+                throw new InvalidProtocolBufferException($"Expected '{JsonFormatter.AnyWellKnownTypeValueField}' property for well-known type Any body");
+            }
+            Merge(body, tokenizer);
+            token = tokenizer.Next();
+            if (token.Type != JsonToken.TokenType.EndObject)
+            {
+                throw new InvalidProtocolBufferException($"Expected end-object token after @type/value for well-known type");
+            }
+        }
+
         #region Utility methods which don't depend on the state (or settings) of the parser.
         private static object ParseMapKey(FieldDescriptor field, string keyText)
         {
@@ -431,17 +581,17 @@ namespace Google.Protobuf
                 case FieldType.Int32:
                 case FieldType.SInt32:
                 case FieldType.SFixed32:
-                    return ParseNumericString(keyText, int.Parse, false);
+                    return ParseNumericString(keyText, int.Parse);
                 case FieldType.UInt32:
                 case FieldType.Fixed32:
-                    return ParseNumericString(keyText, uint.Parse, false);
+                    return ParseNumericString(keyText, uint.Parse);
                 case FieldType.Int64:
                 case FieldType.SInt64:
                 case FieldType.SFixed64:
-                    return ParseNumericString(keyText, long.Parse, false);
+                    return ParseNumericString(keyText, long.Parse);
                 case FieldType.UInt64:
                 case FieldType.Fixed64:
-                    return ParseNumericString(keyText, ulong.Parse, false);
+                    return ParseNumericString(keyText, ulong.Parse);
                 default:
                     throw new InvalidProtocolBufferException("Invalid field type for map: " + field.FieldType);
             }
@@ -452,7 +602,6 @@ namespace Google.Protobuf
             double value = token.NumberValue;
             checked
             {
-                // TODO: Validate that it's actually an integer, possibly in terms of the textual representation?                
                 try
                 {
                     switch (field.FieldType)
@@ -460,16 +609,20 @@ namespace Google.Protobuf
                         case FieldType.Int32:
                         case FieldType.SInt32:
                         case FieldType.SFixed32:
+                            CheckInteger(value);
                             return (int) value;
                         case FieldType.UInt32:
                         case FieldType.Fixed32:
+                            CheckInteger(value);
                             return (uint) value;
                         case FieldType.Int64:
                         case FieldType.SInt64:
                         case FieldType.SFixed64:
+                            CheckInteger(value);
                             return (long) value;
                         case FieldType.UInt64:
                         case FieldType.Fixed64:
+                            CheckInteger(value);
                             return (ulong) value;
                         case FieldType.Double:
                             return value;
@@ -488,18 +641,35 @@ namespace Google.Protobuf
                                 {
                                     return float.NegativeInfinity;
                                 }
-                                throw new InvalidProtocolBufferException("Value out of range: " + value);
+                                throw new InvalidProtocolBufferException($"Value out of range: {value}");
                             }
                             return (float) value;
+                        case FieldType.Enum:
+                            CheckInteger(value);
+                            // Just return it as an int, and let the CLR convert it.
+                            // Note that we deliberately don't check that it's a known value.
+                            return (int) value;
                         default:
-                            throw new InvalidProtocolBufferException("Unsupported conversion from JSON number for field type " + field.FieldType);
+                            throw new InvalidProtocolBufferException($"Unsupported conversion from JSON number for field type {field.FieldType}");
                     }
                 }
                 catch (OverflowException)
                 {
-                    throw new InvalidProtocolBufferException("Value out of range: " + value);
+                    throw new InvalidProtocolBufferException($"Value out of range: {value}");
                 }
             }
+        }
+
+        private static void CheckInteger(double value)
+        {
+            if (double.IsInfinity(value) || double.IsNaN(value))
+            {
+                throw new InvalidProtocolBufferException($"Value not an integer: {value}");
+            }
+            if (value != Math.Floor(value))
+            {
+                throw new InvalidProtocolBufferException($"Value not an integer: {value}");
+            }            
         }
 
         private static object ParseSingleStringValue(FieldDescriptor field, string text)
@@ -509,99 +679,104 @@ namespace Google.Protobuf
                 case FieldType.String:
                     return text;
                 case FieldType.Bytes:
-                    return ByteString.FromBase64(text);
+                    try
+                    {
+                        return ByteString.FromBase64(text);
+                    }
+                    catch (FormatException e)
+                    {
+                        throw InvalidProtocolBufferException.InvalidBase64(e);
+                    }
                 case FieldType.Int32:
                 case FieldType.SInt32:
                 case FieldType.SFixed32:
-                    return ParseNumericString(text, int.Parse, false);
+                    return ParseNumericString(text, int.Parse);
                 case FieldType.UInt32:
                 case FieldType.Fixed32:
-                    return ParseNumericString(text, uint.Parse, false);
+                    return ParseNumericString(text, uint.Parse);
                 case FieldType.Int64:
                 case FieldType.SInt64:
                 case FieldType.SFixed64:
-                    return ParseNumericString(text, long.Parse, false);
+                    return ParseNumericString(text, long.Parse);
                 case FieldType.UInt64:
                 case FieldType.Fixed64:
-                    return ParseNumericString(text, ulong.Parse, false);
+                    return ParseNumericString(text, ulong.Parse);
                 case FieldType.Double:
-                    double d = ParseNumericString(text, double.Parse, true);
-                    // double.Parse can return +/- infinity on Mono for non-infinite values which are out of range for double.
-                    if (double.IsInfinity(d) && !text.Contains("Infinity"))
-                    {
-                        throw new InvalidProtocolBufferException("Invalid numeric value: " + text);
-                    }
+                    double d = ParseNumericString(text, double.Parse);
+                    ValidateInfinityAndNan(text, double.IsPositiveInfinity(d), double.IsNegativeInfinity(d), double.IsNaN(d));
                     return d;
                 case FieldType.Float:
-                    float f = ParseNumericString(text, float.Parse, true);
-                    // float.Parse can return +/- infinity on Mono for non-infinite values which are out of range for float.
-                    if (float.IsInfinity(f) && !text.Contains("Infinity"))
-                    {
-                        throw new InvalidProtocolBufferException("Invalid numeric value: " + text);
-                    }
+                    float f = ParseNumericString(text, float.Parse);
+                    ValidateInfinityAndNan(text, float.IsPositiveInfinity(f), float.IsNegativeInfinity(f), float.IsNaN(f));
                     return f;
                 case FieldType.Enum:
                     var enumValue = field.EnumType.FindValueByName(text);
                     if (enumValue == null)
                     {
-                        throw new InvalidProtocolBufferException("Invalid enum value: " + text + " for enum type: " + field.EnumType.FullName);
+                        throw new InvalidProtocolBufferException($"Invalid enum value: {text} for enum type: {field.EnumType.FullName}");
                     }
                     // Just return it as an int, and let the CLR convert it.
                     return enumValue.Number;
                 default:
-                    throw new InvalidProtocolBufferException("Unsupported conversion from JSON string for field type " + field.FieldType);
+                    throw new InvalidProtocolBufferException($"Unsupported conversion from JSON string for field type {field.FieldType}");
             }
         }
 
         /// <summary>
         /// Creates a new instance of the message type for the given field.
-        /// This method is mostly extracted so we can replace it in one go when we work out
-        /// what we want to do instead of Activator.CreateInstance.
         /// </summary>
         private static IMessage NewMessageForField(FieldDescriptor field)
         {
-            // TODO: Create an instance in a better way ?
-            // (We could potentially add a Parser property to MessageDescriptor... see issue 806.)
-            return (IMessage) Activator.CreateInstance(field.MessageType.GeneratedType);
+            return field.MessageType.Parser.CreateTemplate();
         }
 
-        private static T ParseNumericString<T>(string text, Func<string, NumberStyles, IFormatProvider, T> parser, bool floatingPoint)
+        private static T ParseNumericString<T>(string text, Func<string, NumberStyles, IFormatProvider, T> parser)
         {
-            // TODO: Prohibit leading zeroes (but allow 0!)
-            // TODO: Validate handling of "Infinity" etc. (Should be case sensitive, no leading whitespace etc)
             // Can't prohibit this with NumberStyles.
             if (text.StartsWith("+"))
             {
-                throw new InvalidProtocolBufferException("Invalid numeric value: " + text);
+                throw new InvalidProtocolBufferException($"Invalid numeric value: {text}");
             }
             if (text.StartsWith("0") && text.Length > 1)
             {
                 if (text[1] >= '0' && text[1] <= '9')
                 {
-                    throw new InvalidProtocolBufferException("Invalid numeric value: " + text);
+                    throw new InvalidProtocolBufferException($"Invalid numeric value: {text}");
                 }
             }
             else if (text.StartsWith("-0") && text.Length > 2)
             {
                 if (text[2] >= '0' && text[2] <= '9')
                 {
-                    throw new InvalidProtocolBufferException("Invalid numeric value: " + text);
+                    throw new InvalidProtocolBufferException($"Invalid numeric value: {text}");
                 }
             }
             try
             {
-                var styles = floatingPoint
-                    ? NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint | NumberStyles.AllowExponent
-                    : NumberStyles.AllowLeadingSign;
-                return parser(text, styles, CultureInfo.InvariantCulture);
+                return parser(text, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint | NumberStyles.AllowExponent, CultureInfo.InvariantCulture);
             }
             catch (FormatException)
             {
-                throw new InvalidProtocolBufferException("Invalid numeric value for type: " + text);
+                throw new InvalidProtocolBufferException($"Invalid numeric value for type: {text}");
             }
             catch (OverflowException)
             {
-                throw new InvalidProtocolBufferException("Value out of range: " + text);
+                throw new InvalidProtocolBufferException($"Value out of range: {text}");
+            }
+        }
+
+        /// <summary>
+        /// Checks that any infinite/NaN values originated from the correct text.
+        /// This corrects the lenient whitespace handling of double.Parse/float.Parse, as well as the
+        /// way that Mono parses out-of-range values as infinity.
+        /// </summary>
+        private static void ValidateInfinityAndNan(string text, bool isPositiveInfinity, bool isNegativeInfinity, bool isNaN)
+        {
+            if ((isPositiveInfinity && text != "Infinity") ||
+                (isNegativeInfinity && text != "-Infinity") ||
+                (isNaN && text != "NaN"))
+            {
+                throw new InvalidProtocolBufferException($"Invalid numeric value: {text}");
             }
         }
 
@@ -614,7 +789,7 @@ namespace Google.Protobuf
             var match = TimestampRegex.Match(token.StringValue);
             if (!match.Success)
             {
-                throw new InvalidProtocolBufferException("Invalid Timestamp value: " + token.StringValue);
+                throw new InvalidProtocolBufferException($"Invalid Timestamp value: {token.StringValue}");
             }
             var dateTime = match.Groups["datetime"].Value;
             var subseconds = match.Groups["subseconds"].Value;
@@ -704,28 +879,24 @@ namespace Google.Protobuf
 
             try
             {
-                long seconds = long.Parse(secondsText, CultureInfo.InvariantCulture);
+                long seconds = long.Parse(secondsText, CultureInfo.InvariantCulture) * multiplier;
                 int nanos = 0;
                 if (subseconds != "")
                 {
                     // This should always work, as we've got 1-9 digits.
                     int parsedFraction = int.Parse(subseconds.Substring(1));
-                    nanos = parsedFraction * SubsecondScalingFactors[subseconds.Length];
+                    nanos = parsedFraction * SubsecondScalingFactors[subseconds.Length] * multiplier;
                 }
-                if (seconds >= Duration.MaxSeconds)
+                if (!Duration.IsNormalized(seconds, nanos))
                 {
-                    // Allow precisely 315576000000 seconds, but prohibit even 1ns more.
-                    if (seconds > Duration.MaxSeconds || nanos > 0)
-                    {
-                        throw new InvalidProtocolBufferException("Invalid Duration value: " + token.StringValue);
-                    }
+                    throw new InvalidProtocolBufferException($"Invalid Duration value: {token.StringValue}");
                 }
-                message.Descriptor.Fields[Duration.SecondsFieldNumber].Accessor.SetValue(message, seconds * multiplier);
-                message.Descriptor.Fields[Duration.NanosFieldNumber].Accessor.SetValue(message, nanos * multiplier);
+                message.Descriptor.Fields[Duration.SecondsFieldNumber].Accessor.SetValue(message, seconds);
+                message.Descriptor.Fields[Duration.NanosFieldNumber].Accessor.SetValue(message, nanos);
             }
             catch (FormatException)
             {
-                throw new InvalidProtocolBufferException("Invalid Duration value: " + token.StringValue);
+                throw new InvalidProtocolBufferException($"Invalid Duration value: {token.StringValue}");
             }
         }
 
@@ -748,6 +919,8 @@ namespace Google.Protobuf
         private static string ToSnakeCase(string text)
         {
             var builder = new StringBuilder(text.Length * 2);
+            // Note: this is probably unnecessary now, but currently retained to be as close as possible to the
+            // C++, whilst still throwing an exception on underscores.
             bool wasNotUnderscore = false;  // Initialize to false for case 1 (below)
             bool wasNotCap = false;
 
@@ -781,7 +954,11 @@ namespace Google.Protobuf
                 else
                 {
                     builder.Append(c);
-                    wasNotUnderscore = c != '_';
+                    if (c == '_')
+                    {
+                        throw new InvalidProtocolBufferException($"Invalid field mask: {text}");
+                    }
+                    wasNotUnderscore = true;
                     wasNotCap = true;
                 }
             }
@@ -794,29 +971,48 @@ namespace Google.Protobuf
         /// </summary>
         public sealed class Settings
         {
-            private static readonly Settings defaultInstance = new Settings(CodedInputStream.DefaultRecursionLimit);
-
-            private readonly int recursionLimit;
-
             /// <summary>
-            /// Default settings, as used by <see cref="JsonParser.Default"/>
+            /// Default settings, as used by <see cref="JsonParser.Default"/>. This has the same default
+            /// recursion limit as <see cref="CodedInputStream"/>, and an empty type registry.
             /// </summary>
-            public static Settings Default { get { return defaultInstance; } }
+            public static Settings Default { get; }
+
+            // Workaround for the Mono compiler complaining about XML comments not being on
+            // valid language elements.
+            static Settings()
+            {
+                Default = new Settings(CodedInputStream.DefaultRecursionLimit);
+            }
 
             /// <summary>
             /// The maximum depth of messages to parse. Note that this limit only applies to parsing
             /// messages, not collections - so a message within a collection within a message only counts as
             /// depth 2, not 3.
             /// </summary>
-            public int RecursionLimit { get { return recursionLimit; } }
+            public int RecursionLimit { get; }
+
+            /// <summary>
+            /// The type registry used to parse <see cref="Any"/> messages.
+            /// </summary>
+            public TypeRegistry TypeRegistry { get; }
 
             /// <summary>
             /// Creates a new <see cref="Settings"/> object with the specified recursion limit.
             /// </summary>
             /// <param name="recursionLimit">The maximum depth of messages to parse</param>
-            public Settings(int recursionLimit)
+            public Settings(int recursionLimit) : this(recursionLimit, TypeRegistry.Empty)
             {
-                this.recursionLimit = recursionLimit;
+            }
+
+            /// <summary>
+            /// Creates a new <see cref="Settings"/> object with the specified recursion limit and type registry.
+            /// </summary>
+            /// <param name="recursionLimit">The maximum depth of messages to parse</param>
+            /// <param name="typeRegistry">The type registry used to parse <see cref="Any"/> messages</param>
+            public Settings(int recursionLimit, TypeRegistry typeRegistry)
+            {
+                RecursionLimit = recursionLimit;
+                TypeRegistry = ProtoPreconditions.CheckNotNull(typeRegistry, nameof(typeRegistry));
             }
         }
     }
